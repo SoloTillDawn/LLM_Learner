@@ -24,9 +24,9 @@
 
 - 查看文件占用：du -sh *
 
-- asd
+- ？
 
-- asd
+- ？
 
 - conda环境相关命令：
 
@@ -128,7 +128,7 @@ NVLink NVSwitch
 
 ### 1.1.7 训练时间分析⭐
 
-$\frac{\text{总计算量}=8*模型参数量*token数量}{\text{GPU数量} \times \text{每个GPU的峰值FLOPS} \times \text{GPU利用率}}$
+$\text{训练时间}=\frac{8*模型参数量*token数量}{\text{GPU数量} \times \text{每个GPU的峰值FLOPS} \times \text{GPU利用率}}$
 
 **【Example】**
 
@@ -138,11 +138,27 @@ $\text{训练时间} = \frac{8 \times 175 \times 10^9 \times 300 \times 10^9}{10
 
 
 
+
+
+对于标准的卷积层，FLOPs 计算公式如下：
+
+$\text{FLOPs} = 2 \times C_{\text{in}} \times H_{\text{out}} \times W_{\text{out}} \times K_h \times K_w \times C_{\text{out}}$
+
+征图尺寸，由公式计算：
+
+$H_{\text{out}} = W_{\text{out}} = \frac{H_{\text{in}} - K_h + 2P}{S} + 1$
+
+
+
 ## 1.2 概念
 
 scaling 法则
 
 GGUF (GPT-Generated Unified Format)模型:是由 llama.cpp 定义的一种高效存储和交换大模型预训练结果的二进制格式。
+
+SVD分解
+
+
 
 ## 1.3 架构
 
@@ -167,7 +183,7 @@ GGUF (GPT-Generated Unified Format)模型:是由 llama.cpp 定义的一种高效
 
 兼具理解和生成能力，灵活性强；但计算成本高，适合云端部署。
 
-- Causal(因果)  Decoder(自回归模型)
+- Causal  Decoder(自回归/因果模型)
 
 从左到右的单向注意力。代表：GPT系列、LLaMA、BLOOM、OPT
 
@@ -246,7 +262,9 @@ MLA：https://zhuanlan.zhihu.com/p/15153745590
 HBM是一种高带宽内存接口，用于3D堆叠的SDRAM，具有较高的带宽和较低的功耗。
 SRAM是一种静态随机访问存储器，用于高速缓存等内部存储器，具有更快的访问速度和更低的延迟，但成本更高且占用更多芯片空间。
 
-【代表】LLaMA2-34B/70B
+tiling 的基本思路：不直接对整个输入序列计算注意力，而是将其分为多个较小的块，逐个对这些块进行计算，增量式地进行 softmax 计算，减少全局内存访问次数。计算过程中只需要更新某些中间变量，不需要计算整个注意力权重矩阵。
+
+recomputation 的基本思路：基于 tiling 技巧，在反向传播过程中不保留整个注意力权重矩阵，而是只保留前向过程中 tiling 的某些中间变量，然后在反向传播过程中重新计算注意力权重矩阵。recomputation 可以看作是一种基于 tiling 的特殊的 gradient 
 
 【核心】
 
@@ -261,6 +279,10 @@ SRAM是一种静态随机访问存储器，用于高速缓存等内部存储器�
 14：dropout (Compute Block on SRAM)
 15：计算Oi并写入HBM (Output to HBM)
 16：把li,mi写入HBM (Output to HBM)
+
+【FlashAttention对MQA和GQA如何处理?】
+对MQA和GQA采用Indexing的方式，而不是直接repeat。index思想就是通过传入KV_head索引到GPUKernel中，然后根据内存地址直接从内存中读取KV
+
 【代码】
 https://github.com/shreyansh26/FlashAttention-PyTorch/blob/master/flash_attention.py
 
@@ -448,17 +470,17 @@ PE_{pos,2i}=sin(pos/10000^{2i/d_{model}})\\
 PE_{pos,2i+1}=cos(pos/10000^{2i/d_{model}})
 $$
 
-
+###### ├─ 相对位置编码
 
 ###### ├─ RoPE
 
-目标：RoPE 是一种位置编码方法，旨在通过旋转矩阵将位置信息编码到词向量中，从而更好地捕捉序列中的相对位置关系。
+【目标】RoPE 是一种位置编码方法，旨在通过旋转矩阵将位置信息编码到词向量中，从而更好地捕捉序列中的相对位置关系。
 
-应用场景：适用于需要处理长序列的模型（如 LLaMA、GPT 等）。
+【应用场景】适用于需要处理长序列的模型（如 LLaMA、GPT 等）。
 
-图形化理解：
+【图形化理解】
 
-$\theta$角度会随着”dog“绝对位置变化而旋转。”dog“后面单词的出现不会引起$\theta$旋转
+$\theta$角度会随着”dog“绝awda对位置变化而旋转。”dog“后面单词的出现不会引起$\theta$旋转
 
 <img src="assets/1741851211658.png" style="zoom:50">
 
@@ -467,15 +489,53 @@ $\theta$角度会随着”dog“绝对位置变化而旋转。”dog“后面单
 
 <img src="assets/1741851433947.png" style="zoom:50">
 
-公式理解：
+【公式理解】
+
+为了保持self-attention计算公式不变,即 输入端 = 内积+softmax。
+
+输入端，输出端，softmax不变情况下，对内积进行操作。
+
+。现在问题就是如何在制作内记得情况下，让内积结果和相对位置有关，和绝对位置无关。可以写成公式：
+
+$\langle f_q(q_m, m), f_k(k_n, n) \rangle = g(q_m, k_n, m - n)$
+
+左边内积，右边标量，为了建立桥梁，作者想到了复数:
+
+$f_q(q_m, m) = q_me^{im\theta} = (W_q x_m) e^{im\theta}$
+
+$f_q(a_m, m)^{\top} = \begin{bmatrix} \cos(m\theta) & -\sin(m\theta) \\ \sin(m\theta) & \cos(m\theta) \end{bmatrix} \begin{bmatrix} q_m^{(1)} \\ q_m^{(2)} \end{bmatrix}$
+
+从而得到一个旋转矩阵，并从2维推广到高维
 
 ![74185282281](assets/1741852822814.png)
+
+【进制编码理解—β进制编码】
+
+假设有一个1000以内（不包含1000）的整数n要作为条件输入到模型中，那么要以哪种方式比较好呢？
+
+① 作为一维浮点向量输入——>然而0～999这涉及到近千的跨度，对基于梯度的优化器来说并不容易优化得动。（一个简单的线性层y = w * n + b，w很小，输出变化微弱；如果w很大，可能导致数值不稳定）
+② 缩放到0～1之间——>也不大好，因为此时相邻的差距从1变成了0.001，模型和优化器都不容易分辨相邻的数字。
+③ 将整数n以一个10进制三维向量[a,b,c]来输入，a,b,c分别是n的百位、十位、个位。这样，我们既缩小了数字的跨度，又没有缩小相邻数字的差距，代价了增加了输入的维度。刚好，神经网络擅长处理高维数据。（8进制、6进制甚至2进制）
+
+在③基础上，假设我们还是用三维10进制表示训练了模型，模型效果还不错。然后突然来了个新需求，将n上限增加到2000以内，那么该如何处理呢？
+
+直接外推——>由于某些维度的训练数据不充分，所以直接进行外推通常会导致模型的性能严重下降。——>线性内插(n/k)——>进制转换(不用新增维度，又能保持相邻差距) 
+
+![74278714560](assets/1742787145604.png)
+
+【参考学习】
 
 https://www.bilibili.com/video/BV1aC4y1Z7GS
 
 https://blog.csdn.net/weixin_46039722/article/details/141318082
 
 https://zhuanlan.zhihu.com/p/690610231
+
+https://kexue.fm/archives/9675
+
+├─ NTK-aware
+
+如果输入维度较低且缺乏相应的嵌入，深度神经网络将难以学习高频信息高频成分。**NTK-aware插值用于解决 RoPE 嵌入插值时丢失高频信息的问题。**
 
 ###### ├─ Dynamic NTK（Neural Tangent Kernel）
 
@@ -486,6 +546,8 @@ https://zhuanlan.zhihu.com/p/690610231
 ###### ├─ [YaRN](https://openreview.net/pdf?id=wHBfxhZu1u)（Yet Another RoPE Extension）
 
 目标：Yarn 是一种改进的 RoPE 扩展方法，旨在更高效地扩展上下文窗口。
+
+方法：动态NTK插值 + NTK-by-parts 插值
 
 应用场景：适用于需要**大幅扩展上下文窗口**的模型（如 LLaMA 2/3）。
 
@@ -554,7 +616,7 @@ Tokenizer有三种粒度：word词粒度/char字符粒度/subword子词粒度字
 2. WordPiece不再在单词末尾添加 '</w>'，而是在单词的除开头字符都填充##
 
    ```python
-   score=(freq_of_pair)/(freq_of_first_element×freq_of_second_element)
+   score=(freq_of_pair)/(freq_of_first_element × freq_of_second_element)
    # “word” ===>   w, ##o, ##r, ##d
    ```
 
@@ -581,6 +643,18 @@ Tokenizer有三种粒度：word词粒度/char字符粒度/subword子词粒度字
 https://blog.csdn.net/qq_55841287/article/details/145093477
 
 #### Ⅴ 激活函数
+
+###### ├─ Sigmod
+
+$\sigma(x)=\frac{1}{1+e^{-x}}$
+
+每个输出值是独立事件的概率；输出值之间不互斥；适合二分类；不需要对输出归一化
+
+###### ├─ Softmax
+
+$Softmax(x_i)=\frac{e^{x_i}}{\sum_{j=1}^ne^{x_j}}$
+
+输出是一组互斥类别的概率分布；输出值之间互斥；适合多分类；输出会自动归一化，总和为 1
 
 ###### ├─ Swish
 
@@ -635,7 +709,8 @@ $SwiGLU(a, b)=Swish(a)\otimes\sigma(b)$
 交叉熵(Cross-Entropy)是一种用来衡量两个概率分布之间差异的指标，常用于评估模型输出$Q(x_i)$与真实标签$P（x_i）$之间的差异。
 ![74006298774](assets/1740062987748.png)
 
-KL(Kullback-Leibler Divergence)散度，也称为相对熵，是衡量两个概率分布P和Q差异的非对称性指标。
+KL(Kullback-Leibler Divergence)散度，也称为相对熵，是衡量两个概率分布 P
+和 Q之间的差异程度。使用分布 Q 来近似分布 P 时所损失的信息。
 ![74006345239](assets/1740063452395.png)
 
 【联系】
@@ -644,7 +719,15 @@ KL(Kullback-Leibler Divergence)散度，也称为相对熵，是衡量两个概�
 
 【区别】
 
-假如需要描述一个事情，CE代表：**你总共需要说多少话**，才能描述清楚；KL散度代表：因为你对那个地方了解不够清楚，而**多说的那些话**；熵代表：即使你完全了解那个地方，**最少也要说多少话**才能描述清楚。
+假如需要描述一个事情，CE代表：**你总共需要说多少话**，才能描述清楚；KL散度代表：因为你对那个地方了解不够清楚，而**多说的那些话**；熵代表：即使你完全了解那个地方，**最少也要说多少话**才能描述清楚。y
+
+物理意义：KL散度衡量两个概率分布之间的差异；CE关注的是使用一个编码对另一个分布进行编码的效率；
+
+取值范围：KL≥0，当且仅当P=Q，KL=0
+
+对称性：KL是非对称的，使用Q来近似P所损失的信息与使用P来近似Q所损失的信息是不同的。
+
+
 
 【参考】
 
@@ -668,9 +751,13 @@ http://xhslink.com/a/rQJJRmOHpmi6
 
 $\hat{m}_t = \frac{1}{1-\beta^t_1}m_t$，$\hat{v}_t = \frac{1}{1-\beta^t_2}v_t$
 
-Adam的更新公式：$\theta_{t+1}=\theta_t-\frac{\eta}{\sqrt{\hat{v}_t}+\epsilon}\hat{m}_t$ ，$\theta$为参数
+Adam的更新公式：$\theta_{t+1}=\theta_t-\eta\frac{\alpha\hat{m}_t}{\sqrt{\hat{v}_t}+\epsilon}$ ，$\theta$为参数
 
-AdamW：参数和梯度更新中都引入了L2权重衰减：+$\lambda\theta_{t-1}$
+AdamW：梯度更新中加入$\lambda\theta_{t-1}$是L2正则化莫不是权重衰减，他认为权重衰减是：$\theta_{t+1}=\theta_t-\eta(\frac{\alpha\hat{m}_t}{\sqrt{\hat{v}_t}+\epsilon}+\lambda\theta_{t-1})$
+
+
+
+
 
 ### 1.3.2 解码策略
 
@@ -749,16 +836,52 @@ top-p 采样只从**累积概率超过某个阈值 p** 的最小单词集合中�
 
 效率提升：由于大模型对输入序列并行地执行推理，它只需要进行较少次数的forwardpass就可以生成大量的tokens。虽然大模型的总计算量不变，但由于大模型处理一个token和多个token的延迟相似，这种方法比大模型逐个生成token的速度要快得多。
 
+##### Ⅸ Speculative Decoding, 投机采样⭐
+
+投机采样（Speculative Decoding）是Google[1]和DeepMind[2]在2022年同时发现的大模型推理加速方法——计算访存比优化
+
+【核心思想】
+
+通过 **“草稿模型预测+主模型验证”** 的协同机制，**减少大模型（如LLM）的推理步数**。
+
+【步骤】
+
+1）用小模型/近似模型/n-gram做自回归采样连续生成 $\gamma$个tokens。
+
+2）把生成的$\gamma$个tokens和前缀拼接一起送进大模型执行一次forwards（并行验证）。
+
+3）使用大、小模型logits结果做比对，如果发现某个token小模型生成的不好，重新采样这个token。重复步骤1。
+
+4）如果小模型生成结果都满意，则用大模型采样下一个token。重复步骤1。
+
+【为什么投机采样和自回归采样等价？】
+
+p(x’) > q(x’)说明大模型在token x’上概率大于小模型，则大模型对生成token x’更有把握，说明小模型生成的问题不大可以保留x’。
+
+如果p(x’) ≤ q(x’)则小模型更有把握，大模型就以1-p(x)/q(x)为概率概率拒绝，并重新采样。因为接收的概率更偏向q(x)大的位置，重新采样的概率应该更偏向p(x)大的位置，所以是norm(max(0, p(x)-q(x))。
+
+【加速效果】
+
+$E(\#generated tokens) = \frac{1-\alpha^{1+\gamma}}{1-\alpha}$
+
+一次迭代可以接收小模型的tokens数为#generated tokens。
+
+$\alpha$是反应大模型模型p，q性质的量。
+
 ### 1.3.3 MOE
 
 <img src='assets/1735223706282.png' style='zoom:50'>
 
 【MOE特点】
 
-相同计算代价下，可以增大**网络参数规模**，性能更好。
-基本可以达到相同参数规模的稠密**网络性能**。
-相比同等参数规模的稠密网络，**计算代价**变小。
-相比同等参数规模的稠密网络，**显存占用**不变。
+相同参数，计算代价变小，显存占用不变，推理成本低。
+
+**灵活性强**：MoE模型能够根据不同任务需求，动态调整专家的选择，使得模型的适应性和灵活性非常强。
+
+**扩展性好**：相同计算代价下，可以增大网络参数规模，性能更好。
+
+**多任务学习能力**：
+
 可能有专家**负载不均衡**问题，训练难度增大。
 
 ###### ├─  [Outrageously Large Neural Networks][30]
@@ -811,7 +934,7 @@ Encorder 中不同的专家倾向于专注于特定类型的 token 或浅层概�
 
 【组成】
 
-1. 专家头包括 **Share**专家和**Router**专家；
+1. 专家头包括 **Share**专家和**Router**专家；2,64
 
 2. **Share 专家** 是一直激活的，即输入的 token 都会被 Share 专家头计算。
 
@@ -977,12 +1100,61 @@ System Prompts 和 System Messages 是通过 ChatGPT 的 Chat Completions API �
 文本分析（针对基于文本的列）：    基于主题或情绪执行分类。
 趋势分析（针对具有时间属性的数据集）：识别列之中随时间演进的模式、季节变化或趋势。
 
-#### 2.1.n 其它prompt技术
+
+
+### 其它prompt技术
 
 - **索引每一步的中间输出**：在为 LLM 提供逐步过程时，我们给出了每一步的中间输出结果，其中用的大写变量名指代。然后，可以通过加方括号的形式 [变量名] 索引这些中间输出。
+
 - **设置 LLM 的响应的格式**：可以利用上中间输出的变量名，更方便地指定报告的结构，生成markdwon、文本、dpf。
+
 - **将任务指令与数据集分离开**：有助于 LLM 清晰理解每一部分，降低遗漏信息的可能性；
+
 - 除了CO-STAR，还有APE/CARE/RACE/COAST/CRISPE/RISE/TRACE/ROSES/LangGPT
+
+- ChatGPT 帮你写 Prompt
+
+  ```
+  1. I want you to become my Expert Prompt Creator. Your goal is to help me craft the best possible prompt for my needs. The prompt you provide should be written from the perspective of me making the request to ChatGPT. Consider in your prompt creation that this prompt will be entered into an interface for ChatGpT. The process is as follows:1. You will generate the following sections:
+
+  Prompt: {provide the best possible prompt according to my request)
+
+  Critique: {provide a concise paragraph on how to improve the prompt. Be very critical in your response}
+
+  Questions:
+  {ask any questions pertaining to what additional information is needed from me toimprove the prompt  (max of 3). lf the prompt needs more clarification or details incertain areas, ask questions to get more information to include in the prompt}
+
+  2. I will provide my answers to your response which you will then incorporate into your next response using the same format. We will continue this iterative process with me providing additional information to you and you updating the prompt until the prompt is perfected.Remember, the prompt we are creating should be written from the perspective of me making a request to ChatGPT. Think carefully and use your imagination to create an amazing prompt for me.
+  You're first response should only be a greeting to the user and to ask what the prompt should be about
+  ```
+
+- ？
+
+- ？
+
+### Prompt攻击
+
+#### 攻击方式
+
+- 奶奶漏洞。
+
+用套路把AI 绕懵。
+
+example：奶奶还会给我念Office365的序列号哄我入睡
+
+- Prompt 注入。
+
+用户输入的 prompt 改变了系统既定的设定，使其输出违背设计意图的内容。
+
+#### 防范措施
+
+- Prompt 注入分类器
+
+机场安检的思路，先把危险 prompt 拦截掉。
+
+- 直接在输入中防御
+
+「墙上刷口号」
 
 ## 2.1 Prompt-learning（提示学习）
 
@@ -1135,9 +1307,27 @@ System Prompts 和 System Messages 是通过 ChatGPT 的 Chat Completions API �
 ### 2.1.7 其它prompt技术
 
 - **索引每一步的中间输出**：在为 LLM 提供逐步过程时，我们给出了每一步的中间输出结果，其中用的大写变量名指代。然后，可以通过加方括号的形式 [变量名] 索引这些中间输出。
+
 - **设置 LLM 的响应的格式**：可以利用上中间输出的变量名，更方便地指定报告的结构，生成markdwon、文本、dpf。
+
 - **将任务指令与数据集分离开**：有助于 LLM 清晰理解每一部分，降低遗漏信息的可能性；
+
 - 除了CO-STAR，还有APE/CARE/RACE/COAST/CRISPE/RISE/TRACE/ROSES/LangGPT
+
+- ReAct
+
+  ​
+
+  ![74407994220](assets/1744079942201.png)
+
+
+
+
+
+
+​	https://www.bilibili.com/video/BV1WC411b7VM/?spm_id_from=333.337.search-card.all.click&vd_source=c6b28d97b8f1e14b8f636b80ac7b4ea5
+
+- ?
 
 
 
@@ -1146,12 +1336,6 @@ System Prompts 和 System Messages 是通过 ChatGPT 的 Chat Completions API �
 #### ⅠOpenPrompt
 
 【地址】https://github.com/thunlp/OpenPrompt
-
-### 2.1.10 Applications
-
-
-
-
 
 
 
@@ -1172,6 +1356,7 @@ Delta Tuning，即参数高效微调方法，是指在预训练模型的基础�
 - 和类似方法进行比较。
 - 标准化PEFT测量基准。
 - 重视代码清晰度，以最小化进行实现。
+- **在参数量大于10B后，微调方法的效果可以接近全参数微调的效果。**
 
 ### 2.2.-1 相关概念
 
@@ -1186,7 +1371,7 @@ Delta Tuning，即参数高效微调方法，是指在预训练模型的基础�
 ② 克服灾难性遗忘；
 ③ 低数据环境下更好的性能；
 ④ 可移植性；
- ⑤ 与完全微调相当的性能。
+⑤ 与完全微调相当的性能。
 
 **技术**：
 ① <u>Selective Layer Tuning(选择性层调整)</u>：可以只微调层的一个子集，而不是微调模型的所有层，减少需要更新的参数数量；
@@ -1276,17 +1461,21 @@ Scaling Down to Scale Up: A Guide to Parameter-Efficient Fine-Tuning
 
 ##### Ⅲ [Prefix-Tuning][5]⭐
 
+![74237237696](assets/1742372376961.png)
+
 【步骤】在模型的**每一层**添加k个额外可训练的soft prompts(连续的，随机初始化的伪tokens)，冻结PLM，只训练这些前缀参数;
 
 【理论效果】好：可以为不同任务保存不同的前缀，微调成本也小；这种Prefix实际就是连续可微的Virtual Token（Soft Prompt/Continuous Prompt），相比离散的Token，更好优化，效果更好。
 
 ​                       坏：?
 
+【适合】引导生成任务
+
 【实践效果】
 
 <img src='assets/1730376070549.png' style='zoom:20'>
 
-同时，为了防止直接更新Prefix的参数导致训练不稳定和性能下降的情况，在Prefix层前面加了MLP结构，训练完成后，只保留Prefix的参数。
+同时，为了防止直接更新Prefix的参数导致训练不稳定和性能下降的情况，在Prefix层前面加了**MLP结构**，训练完成后，只保留Prefix的参数。
 
 ![73555861954](assets/1735558619547.png)
 
@@ -1315,9 +1504,45 @@ Prompt Tuning 还提出了 Prompt Ensembling，也就是**在一个批次（Batc
 
 ##### Ⅴ [P-tuning][34]✔
 
+相比Prefix Tuning，P-Tuning加入的可微的virtual token，但仅限于输入层，没有在每一层都加；另外，virtual token的**位置也不一定是前缀，插入位置可选**。（出发点：把传统人工设计模版中的真实token替换成可微的virtual token）
+
+经过预训练的LM的词嵌入已经变得高度离散，如果随机初始化virtual token，容易优化到局部最优值，而这些virtual token理论是应该有相关关联的。因此，作者通过实验发现用一个prompt encoder来编码会收敛更快，效果更好。即用一个**LSTM/MLP**去编码这些virtual token以后，再输入到模型。
+
+将提示转换为可学习嵌入，优化 NLU 任务（如分类、序列标注）
+
+![74237239184](assets/1742372391842.png)
+
+【优点】
+
+- 避免人工设计提示模板的繁琐。
+- 在小样本场景下表现优异，显著降低计算成本。
+
+【缺点】
+
+- 在超大规模模型（如10B+参数）或复杂任务（如序列标注）上效果不稳定。
+- 仅作用于输入层，未充分利用模型的深层表示能力。
+
 ###### ├─P-tuning v2⭐
 
-【步骤】参考==Prefix Tuning的深度提示优化==：每层加入Prompts tokens作为输入；移除重参数化的编码器(如：Prefix Tuning中的MLP、P-Tuning中的LSTM)；引入多任务学习(先在多任务的Prompt上进行预训练，然后再适配下游任务)，针对不同任务采用不同的提示长度；回归传统的分类标签范式，而不是映射器。
+【动机】
+
+缺乏规模通用性：Prompt Tuning在较小的模型（从100M到1B）上表现一般；
+
+缺乏任务普遍性：尽管Prompt Tuning和P-tuning在一些 NLU 基准测试中表现出优势，但提示调优对硬序列标记任务（即序列标注）的有效性尚未得到验证。
+
+缺少深度提示优化：在Prompt Tuning和P-tuning中，连续提示只被插入transformer第一层的输入embedding序列中。
+
+【步骤】
+
+参考==Prefix Tuning的深度提示优化==：每层加入Prompts tokens作为输入；
+
+**移除重参数化的编码器**(如：Prefix Tuning中的MLP、P-Tuning中的LSTM)：重参数化的改进很小，尤其是对于较小的模型，同时还会影响模型的表现。
+
+**针对不同任务采用不同的提示长度**；
+
+**引入多任务学习**，先在多任务的Prompt上进行预训练，然后再适配下游任务。
+
+**回归传统的分类标签范式，而不是映射器**。
 
 【特点】
 
@@ -1325,11 +1550,22 @@ Prompt Tuning 还提出了 Prompt Ensembling，也就是**在一个批次（Batc
 移除了对模型效果改进较小的重参数化的编码器；
 对于一些复杂的硬序列标记任务（即序列标注）取得了不错的效果。
 
-【理论效果】
+【优点】
 
-好：
+- 在复杂任务和大模型上效果显著优于原始P-tuning。
+- 支持更广泛的下游任务，尤其在低资源场景下表现突出。
 
-坏：
+【缺点】
+
+- 在超大规模模型（如10B+参数）或复杂任务（如序列标注）上效果不稳定。
+- 仅作用于输入层，未充分利用模型的深层表示能力。
+
+【区别】
+
+P-Tuning认为是针对Prompt Tuning的改进，P-Tuning v2认为是针对Prefix Tuning的改进。
+
+- **P-tuning**：提示位置仅输入层；适合生成任务（如文本续写）、小样本分类任务；适合中小规模模型；低资源时可能不稳定；实现简单
+- **P-tuning v2**：提示位置每一层；适用于需要深层语义理解的任务（如NER、关系抽取）；适合超大模型；通过分层提示和正则化提升稳定性；实现复杂
 
 ### 2.2.2 Specification(指定式) tuning
 
@@ -1374,6 +1610,14 @@ A随机初始化矩阵，服从正态分布；B初始化为零矩阵。
 - B和A全部初始化为零矩阵，很容易导致梯度消失。
 - 如果B和A全部初始化正态分布，那么在模型训练开始时，就会容易得到一个过大的偏移值$\bigtriangleup W$，从而引起太多噪声，导致难以收敛。
 
+【初始化策略】
+
+- 高斯初始化A + 零初始化B：适用于大多数任务，尤其是需要保留预训练知识的场景；当任务与预训练模型的领域接近，这种策略能快速收敛。
+- Xavier初始化A + 零初始化B：适用于模型较深以及全连接层适配
+- Kaiming 初始化A + 零初始化B：适用于视觉任务
+- 高斯初始化A + 小随机值初始化 B：适用于风格迁移或生成特定风格文本任务
+- 零初始化A + 零初始化B：容易梯度消失和爆炸
+
 【公式与代码】
 
   $W' = W + (\alpha / \gamma)A·B$
@@ -1400,6 +1644,22 @@ lora_config = LoraConfig(
 )
 ```
 
+【优点】
+
+参数少、训练和推理效率高、模块化和可移植性强、易于实现和扩展；
+
+【缺点】
+
+性能可能略低于全参数微调、低秩假设的sww局限性、需要调参、初始化敏感性
+
+出现”侵入维度“：MIT在研究不同微调方法如何改变模型时，发现LORA微调模型中会出现一些与预训练权重矩中的奇异向量近似正交的奇异向量。
+
+【调参】
+
+$r$：调整根据数据量和任务难度调整，小数据就r小，大数据就r大
+
+$\alpha$：调参等效于LR调整。
+
 【有效性】
 
 低秩假设：在微调过程中，模型权重的变化通常集中在某些特定的方向上（即低维子空间），而不是整个高维空间。
@@ -1410,10 +1670,6 @@ lora_config = LoraConfig(
 
 工业验证：工业实践表明，LoRA 在 SFT、DPO 和 RLHF 中效果显著
 
-【理论效果】好：在简单任务上能达到与全参数微调差不多的效果
-
-​                       坏：?
-
 【实践效果】
 
 - LoRA 仅能够让模型学会输出的格式，完全无法获取新知识，同时增大数据集的规模对 LoRA 无效。
@@ -1423,7 +1679,9 @@ lora_config = LoraConfig(
 
 ###### ├─[AdaLoRA][38]
 
-【步骤】对LoRA的一种改进，它根据重要性评分动态分配参数预算给权重矩阵，将关键的增量矩阵分配高秩以捕捉更精细和任务特定的信息，而将较不重要的矩阵的秩降低，以防止过拟合并节省计算预算。
+【思想】对LoRA的一种改进，它根据重要性评分动态分配参数预算给权重矩阵，将关键的增量矩阵分配高秩以捕捉更精细和任务特定的信息，而将较不重要的矩阵的秩降低，以防止过拟合并节省计算预算。
+
+LoRA中已指出不同模块在模型中的重要性不同，与之对应的不同重要性的模块最好拥有不同的秩。于是，AdaLoRA对每个模块的秩自适应调整。具体讲，AdaLoRA基于SVD的形式参数化增量更新，这种基于SVD的参数化形式可以在规避SVD复杂的计算的同时高效裁剪不重要的奇异值，从而降低计算量。
 
 【理论效果】好：在简单任务上能达到与全参数微调差不多的效果
 
@@ -1443,7 +1701,23 @@ lora_config = LoraConfig(
 
 【实践效果】
 
-###### ├─QLoRA
+###### ├─DLoRA
+
+将预训练权重矩阵分解为 幅度 和 方向 两部分，分别对其进行LoRA
+
+###### ├─QLoRA⭐
+
+###### ├─[LongLoRA](https://arxiv.org/pdf/2309.12307)⭐
+
+![74282156151](assets/1742821561511.png)
+
+【解决什么问题】解决长上下文注意力机制计算量很大的问题
+
+【方法/如何解决的问题】shift short attention (S^2 attention，移位短注意力）替换dense global attention
+
+pattern-1中，运用局部注意力，将token分组，分别引用MHA，随着上下文长度的增加，模型的PPL也会变得更大。原因是在不同的组之间没有信息交换，部分信息丢失。
+
+于是pattern-2中采用组大小一半的移位操作(最后和开头拼接)，确保相邻组之间顺利的信息交换
 
 ### 2.2.4 Unifield(统一/混合) tuning
 
@@ -1552,19 +1826,33 @@ https://zhuanlan.zhihu.com/p/598714869
 
   （https://github.com/HuangLK/transpeeder）
 
-### 2.3.1 Collective Communication
+### 2.3.1 多卡通信
 
-都是 **规约**操作，包括avg/sum/max等等
+【P2P】
 
-Reduce：经过③+④，参数放入一个卡，然后再   `Broadcast` 到其余多个显卡上。
+这种模式只有一个sender和receiver，可以进一步分成：1）阻塞型P2P, (e.g. PyTorch的 `torch.distributed.send/recv`）；2）非阻塞型P2P, (e.g. PyTorch中的 `torch.distributed.isend/irecv`）
 
-All Reduce：经过③+④，参数放入所有显卡。
+【Collective Communication】
 
-Reduce Scatter：经过③+④，参数放入所有显卡。只得到一部分的参数
+**broadcast：**一个sender给其它所有receiver发送相同的数据；
 
-All Gather：
+**Reduce：**一个receiver接收其它senders发送过来的数据，并对这些数据做了reduction操作 (e.g. reduce_sum)；
 
-<img src='assets/1730447661996.png' style='zoom:30'>
+**scatter：**一个sender给其它所有receiver发送部分数据；
+
+**gather：**一个receiver接收其它senders发送过来的数据，组合成完整数据；
+
+**All Gather：**gather操作的extension，等价于gather + broadcast；
+
+**All Reduce：**reduce操作的extension，等价于reduce + broadcast；
+
+**Reduce Scatter：**?
+
+**Ring All_Reduce：**（下面）。
+
+<img src='assets/1745068014642.png' style='zoom:'>
+
+https://zhuanlan.zhihu.com/p/617133971
 
 ### 2.3.2 Data Parallelisms, 数据并行
 
@@ -1593,9 +1881,24 @@ All Gather：
 
 - DP是单进程多线程的，只能在单机上工作；DDP是多进程的，可以在多级多卡上工作。DP通常比DDP慢，主要原因有：1）DP是单进程的，受到GIL（全局解释器锁，只允许一个线程保持 Python 解释器的控制权）的限制；2）DP每个step都需要拷贝模型，以及划分数据和收集输出；
 - DDP可以与模型并行相结合；
-- DP的通信成本随着卡数线性增长，DDP支持Ring-AllReduce，通信成本是固定的。
+- DP的通信成本随着卡数线性增长，DDP支持Ring-All Reduce，通信成本是固定的。
 
 
+##### Ⅳ Ring-All Reduce
+
+ring scatter-reduce + all-gather
+
+ring scatter-reduce阶段：将数据partition成N 份，其中N 是通信节点数；进行`N-1` 次send / receive数据传输
+
+all-gather阶段：`N-1` 次sends and receives操作来完成ring all_gather操作
+
+![74496214924](assets/1744962149241.png)
+
+完整的数据是K bytes，传输1 byte的耗时为b，由于一共进行了`2(N-1)` 次data transfer，然后每一次data transfer，每个GPU都是send`K/N` 个bytes，同时也recive`K/N` bytes。所以完成一次ring all_reduce的耗时为`2(N-1)*K/N* b` = `2(1-1/N)Kb`
+
+【优点】减少通信开销；降低网络带宽需求；可扩展性；负载均衡
+
+【局限性】减少了通信开销带了一定通讯延迟；同步瓶颈；实现复杂度（需要进行环形拓扑的管理和通信控制）
 
 ### 2.3.3 Model Parallelisms, 模型并行
 
@@ -1617,7 +1920,7 @@ All Gather：
 
 ###### Paper - [Gpipe][9] 
 
-① 切分micro-batch**
+① 切分micro-batchc
 
 【核心思想】在模型并行的基础上，进一步引入数据并行的办法，即把原先的数据再划分成若干个batch，送入GPU进行训练。未划分前的数据，叫`mini-batch`。在`mini-batch`上再划分的数据，叫`micro-batch`。
 
@@ -1668,32 +1971,29 @@ All Gather：
 
 将模型参数、优化器状态、梯度分布到不同设备，减少显存冗余。
 
-【**Zero-1** 步骤】
+【**Zero-1** 步骤】（显存消耗减少 4 倍，通信量与数据并行相同）
 
-① 先将参数服务器中的参数 `Broadcast` 到其余多个显卡上(同步)；然后将数据切分划分到不同显卡上；
-② 然后进行FP和BP，获取梯度   `Gradient`；
-③ 在BP结束后，然后对这些  `Gradient` 进行**Reduce Scatter规约**得到每张显卡各自的 `  Gradient*` ；
-④ 每张显卡用对应参数和`  Gradient*` 送入优化器更新参数；
-⑤ 最后使用All Gather收集和拼接所有更新的参数，然后告诉所有的显卡。
+① 每个GPU加载相同的完整模型参数 + 将<u>优化器</u>状态按 **GPU数量分片**，每个GPU仅存储自身负责的分片。
+② FP：将数据均匀分配到各GPU，各GPU独立执行前向传播，生成Loss。
+③ BP：各GPU独立计算本地   `Gradient`；通过 **AllReduce（如NCCL）** 对所有GPU的梯度求平均（保持参数一致性）。
+④ 各GPU仅更新自己负责的参数状态分片
+⑤ 最后使用**All Gather**收集和拼接所有更新的参数，然后告诉所有的显卡。
 
-<img src="assets/1730702935209.png" style="zoom:30">
+【**Zero-2** 步骤】（显存消耗减少 8 倍，通信量与数据并行相同）
 
-【**Zero-2** 步骤】
-
-① 先将参数服务器中的参数 `Broadcast` 到其余多个显卡上(同步)；然后将数据切分划分到不同显卡上；
-② 然后进行FP和BP，获取梯度   `Gradient`；
-③ 在BP过程中，在每次获取到`  Gradient*`之后就释放 `Gradient` 。例如：有一个24层的Transformer,在24层的BP结束后，就用24层各卡的 `Gradient` 进行**Reduce Scatter**得到`  Gradient*` ，释放24层`Gradient` ，同理23层，22层...
-④ 每张显卡用对应参数和`  Gradient*` 送入优化器更新参数；
+① 每个GPU加载相同的完整模型参数 + 将 <u>梯度和优化器</u>状态 按 **GPU数量分片**，每个GPU仅存储自身负责的分片。
+② FP：将数据均匀分配到各GPU，各GPU独立执行前向传播，生成Loss。（不涉及其他 GPU 的通信）
+③ BP：各GPU独立计算本地   `Gradient`；通过 **AllReduce（如NCCL）** 聚合数据并同步对所有GPU的梯度求平均（保持参数一致性）
+④ 各GPU仅更新自己负责的参数状态分片
 ⑤ 最后使用**All Gather**收集和拼接所有更新的参数，然后告诉所有的显卡。
 
 【**Zero-3** 步骤】
 
-① 先将参数服务器中的参数 `Broadcast` 到其余多个显卡上(同步)；然后将数据切分划分到不同显卡上；
-② 把模型参数进行一个划分保留在各自显卡上。在FP过程中，把模型参数进行一个**All Gather**收集拼接
-③ 在BP过程中，在每次获取到`  Gradient*`之后就释放 `Gradient` 。
-例如：有一个24层的Transformer,在24层的BP结束后，就用24层各卡的 `Gradient` 进行**Reduce Scatter**得到`  Gradient*` ，释放24层`Gradient` ，同理23层，22层...
-④ 每张显卡用对应参数和`  Gradient*` 送入优化器更新参数；
-⑤ 更新的参数只会对应各自卡上的参数。
+① 将 <u>参数、梯度和优化器</u>状态 按 **GPU数量分片**，每个GPU仅存储自身负责的分片。
+② FP：将数据均匀分配到各GPU，需要**All Gather**通过收集和拼接所有更新的参数，然后各GPU独立执行前向传播，生成Loss。（不涉及其他 GPU 的通信）
+③ BP：各GPU独立计算本地   `Gradient`；通过 **AllReduce（如NCCL）** 对所有GPU的梯度求平均（保持参数一致性）
+④ 各GPU仅更新自己负责的参数状态分片
+⑤ 最后使用All Gather收集和拼接所有更新的参数，然后告诉所有的显卡。
 
 【Zero-总图】
 
@@ -1702,6 +2002,8 @@ All Gather：
 【实现参考】https://docs.oneflow.org/master/cookies/zero.html
 
 ##### Ⅵ  Zero Redundancy Optimizer, [ZeRO-R][8], 零冗余优化剩余空间⭐
+
+##### Ⅶ Fully Sharded Data Parallel, FSDP, 全切片数据并行技术
 
 ### 2.3.5 Sequence Parallelism, 序列并行
 
@@ -1733,7 +2035,7 @@ All Gather：
 
 ###### Alpa
 
-### 2.3.8 MOE并行
+### 2.3.8 MOE并行, EP
 
 ##### Ⅰ MOE+数据并行
 
@@ -2066,8 +2368,8 @@ Continuous batching、Offload
 【步骤】
 
 一个典型的带有 KV cache优化的生成大模型的推理过程包含了两个阶段：
-1.预填充阶段：输入一个prompt序列，为每个transformer层生成key cache和value cache(KV cache)。
-2.解码阶段：使用并更新KVcache，一个接一个地生成token，当前生成的token词依赖于之前已经生成的token。
+**预填充阶段：**输入一个prompt序列，为每个transformer层生成key cache和value cache(KV cache)。
+**解码阶段：**使用并更新KVcache，一个接一个地生成token，当前生成的token词依赖于之前已经生成的token。
 
 【调用】model.generate时`use_cache`参数设置为True
 
@@ -2097,6 +2399,8 @@ https://blog.csdn.net/qq_35229591/article/details/142334265
 Continuing Batching，（也叫 Inflight batching 或 Iteration batching），是指请求在到达时一起批量处理，但它不是等待批次中所有序列都完成，而是**当一个输入提示生成结束**之后，就会在其位置将新的输入Prompt插入进来，从而比静态批处理具备更高的 GPU 利用率。
 
 ![74020981311](assets/1740210174505.png)
+
+https://zhuanlan.zhihu.com/p/719610083
 
 #### 2.7.2.3 Chunked Prefill, 分块预填充
 
@@ -2134,7 +2438,9 @@ https://juejin.cn/post/7420231738558627874
 
 ### 2.7.4 访存优化
 
-FlashAttention
+#### 2.7.4.1 FlashAttention
+
+#### 2.7.4.2 Speculative Decoding，投机采样
 
 ### 2.7.5 解码优化
 
@@ -2156,9 +2462,9 @@ Speculative Decoding及其变体
 
 ② 数据校准
 
-校准数据集：使用一小部分训练集或代表性样本来统计激活值分布。这些样本应覆盖任务的主要数据特性。
+**校准数据集：**使用一小部分训练集或代表性样本来统计激活值分布。这些样本应覆盖任务的主要数据特性。
 
-统计分布范围：计算权重和激活值的最小值和最大值，确定量化范围。
+**统计分布范围：**计算权重和激活值的最小值和最大值，确定量化范围。
 
 ③ 权重量化
 
@@ -2168,17 +2474,17 @@ Speculative Decoding及其变体
 
 ⑥ 效果评估
 
-压缩率：通过存储大小变化评估模型压缩效果。
+**压缩率：**通过存储大小变化评估模型压缩效果。
 
 ​					$压缩率=1 - \frac{量化后模型大小}{量化前模型大小}$
 
-性能测试：在验证集上测试模型的精度，比较量化前后的性能差异。
+**性能测试：**在验证集上测试模型的精度，比较量化前后的性能差异。
 
-推理速度：测量量化模型的推理时间，验证是否提升推理速度。
+**推理速度：**测量量化模型的推理时间，验证是否提升推理速度。
 
-硬件适配性：测试功耗和延迟，确保量化模型适合目标部署环境。
+**硬件适配性：**测试功耗和延迟，确保量化模型适合目标部署环境。
 
-数值稳定性：通过模拟实际部署环境，验证量化模型在不同输入分布下的数值稳定性。
+**数值稳定性：**通过模拟实际部署环境，验证量化模型在不同输入分布下的数值稳定性。
 
 ### 2.8.0 预备知识
 
@@ -2331,6 +2637,18 @@ Lion: Adversarial Distillation of Closed-Source Large Language Model
 
 ###### ├─ paper - [QLoRA][19] - NF4+DQ
 
+是一种用于高效微调大型语言模型（LLMs）的技术，结合了**量化**和**低秩适配器（LoRA）**的优点。它的目标是在保留模型性能的同时，大幅减少计算资源需求，使得微调大型模型变得更加高效和实用。
+
+【流程】
+
+将预训练的大型语言模型加载，并量化为低精度表示，权重保持冻结状态，不参与更新；
+
+在关键层（如 Transformer 的投影层）中，插入低秩矩阵 A和 B，用于学习特定任务的微调更新；
+
+微调阶段：反量化模型精度，仅训练低秩适配器（A,B），不更新模型主干参数。
+
+推理阶段：量化后的模型权重与适配器共同工作，提供任务特定的输出。
+
 【特点】
 
 节省内存，但增加运行时间成本
@@ -2338,7 +2656,7 @@ Lion: Adversarial Distillation of Closed-Source Large Language Model
 **① 4-bit NormalFloat Quantization, 4位标准浮点数量化**
 
 ```
-Q = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0]
+量化值集合Q = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0]
 ```
 
 结合了分位数量化和分块量化。例子：
@@ -2494,6 +2812,9 @@ LoRAPrune（低秩分解+剪枝）
 
 简单来说，就是给 LLM 提供外部数据库，对于用户问题 ( Query )，通过一些信息检索 ( Information Retrieval, IR ) 的技术，先从外部数据库中检索出和用户问题相关的信息，然后让 LLM 结合这些相关信息来生成结果。下图是一个检索增强 LLM 的简单示意图。
 
+RAG是一种通过检索外部知识库来获得额外语料，并使用ICL(In-Context-Learning，上
+下文学习来改进LLM生成效果的范式
+
 ### 2.9.1 解决什么问题
 
 ① **长尾知识**：对于一些<u>相对通用和大众的知识</u>，LLM 通常能<u>生成比较准确的结果</u>，而对于一些<u>长尾知识</u>，LLM 生成的<u>回复通常并不可靠</u>。LLM 对基于事实的问答的准确性和预训练数据中相关领域文档数量的关系，发现有很强的相关性，即预训练数据中相关文档数量越多，LLM 对事实性问答的回复准确性就越高。（长尾知识：那些不常见、比较晦涩或极为特定的信息，这些信息不经常出现或众所周知）
@@ -2516,6 +2837,12 @@ LoRAPrune（低秩分解+剪枝）
 - **响应生成模块**：如何利用检索出的相关信息来增强 LLM 的输出
 
 <img src='assets/1727094482783.png' style='zoom:'>
+
+RAG 的流程：
+
+离线步骤：文档加载->切分->向量化->灌库
+
+在线步骤：问题->向量化->检索->Prompt->LLM->回复
 
 ##### Ⅰ 业务数据 ==> 信息提取
 
@@ -2614,7 +2941,7 @@ https://blog.csdn.net/m0_59235945/article/details/143027480
 
 #### 2.9.4.4 ARES评估框架
 
-是自动化评价 RAG 系统在上下文相关性、答案忠实度和答案相关性三个方 面的性能。ARES减少了评估成本，通过使用少量的手动标注数据和合成数据，并应用预测 驱动推理 (PDR) 提供统计置信区间，提高了评估的准确性。
+是自动化评价 RAG 系统在上下文相关性、答案忠实度和答案相关性三个方面的性能。ARES减少了评估成本，通过使用少量的手动标注数据和合成数据，并应用预测 驱动推理 (PDR) 提供统计置信区间，提高了评估的准确性。
 
 【算法原理】
 
@@ -2626,30 +2953,56 @@ https://blog.csdn.net/m0_59235945/article/details/143027480
 
 https://github.com/stanford-futuredata/ARES
 
-
-
-
-
 ### 2.9.5 RAG架构优化策略
 
 ### 2.9.6 RAG索引优化策略
 
+嵌入优化
+
+反复调整向量存储中检索文档的长度
+
+混合检索
+
+重新排名
+
 ### 2.9.7 RAG索引数据优化策略
 
-### 2.9.8 RAG未来发展方向
+提升索引数据的质量：清洗
 
+添加元数据
 
+输入查询与文档对齐
 
+提示压缩
 
+### 2.9.8 RAG方法
+
+#### GraphRAG
+
+【动机】知识图谱可以减少基于嵌入的语义搜索所导致的不准确性。
+
+【定义】是一种基于知识图谱的检索增强技术，通过构建图模型的知识表达，将实体和关系之间的联系用图的形式进行展示，然后利用大语言模型 LLM进行检索增强。
+
+【思想】对用户输入的query提取实体，然后构造子图形成上下文，最后送入大模型完成生成
+
+【排序优化】
+
+基于知识图谱召回的方法可以和其他召回方法一起融合，但这种方式在图谱规模很大时其实是有提升空间的。突出的缺点在于：
+• 子图召回的多条路径中可能会出现多种不相关的。
+• 实体识别阶段的精度也有限，采用关键词提取还比较暴力，方法也值得商榷。
+• 这种方式依赖于一个基础知识图谱库，如果数据量以及广度不够，有可能会引入噪声。
+
+因此，还可以再加入路径排序环节，可参考**先粗排后精排**的方式，同样走过滤逻辑。
 
 ## 2.10 数据集工程
 
 ![74083891268](assets/1740838912687.png)
 
+**Pipeline：**(1)语言过滤、(2)启发式过滤、(3)数据质量、(4)领域相关、(5)去重、(6)去除有毒数据、(7)数据混合。
+
 ### 数据集格式
 
-#### SFT的数据集格式
-
+- #### SFT的数据集格式
 
 
 ```python
@@ -2661,8 +3014,8 @@ https://github.com/stanford-futuredata/ARES
     'value': '《聖經語...的不'},
    {'from': 'human', 'value': '繼續'},
    {'from': 'gpt',
-    'value': '同...含義。'}【】
-      ]
+    'value': '同...含義。'}
+    ]
   },
  {"conversations":[
    ...
@@ -2677,7 +3030,8 @@ https://github.com/stanford-futuredata/ARES
 }
 ```
 
-#### RM(奖励模型)的数据集格式
+- #### RM(奖励模型)的数据集格式
+
 
 输入数据：(字符串形式或者tokenized)文本序列
 
@@ -2685,9 +3039,8 @@ https://github.com/stanford-futuredata/ARES
 
 数据集格式：数据集可以以文本文件（如CSV、JSON等）或数据库的形式存储。
 
+- #### PO数据格式
 
-
-#### PO数据格式
 
 常见：投票、排序、打分
 
@@ -2724,9 +3077,32 @@ https://github.com/alibaba/data-juicer
 
 ##### 构造SFT数据
 
-###### ├─ self-instruct
+###### ├─ [self-instruct](https://arxiv.org/pdf/2212.10560)
+
+![74340194715](assets/1743401947156.png)
+
+【步骤】
+
+① 利用PLM扩展初始人工编写的种子指令。
+输入：种子指令文件(seed_instructions.jsonl)
+输出：自动生成的指令文件 (machine_generated_instructions.jsonl)
+
+② 识别并标记指令是否为分类任务。
+输入：自动生成的指令文件 (machine_generated_instructions.jsonl)
+输出：指令分类标签文件 (is_clf_or_not_davinci_template_1.jsonl)
+
+③ 为每个指令生成具体的输入输出对（实例）。
+输入：自动生成的指令文件 (machine_generated_instructions.jsonl)
+	    指令分类标签文件 (is_clf_or_not_davinci_template_1.jsonl)
+输出：实例文件 (machine_generated_instances.jsonl)
+
+④ 准备用于微调的数据集。
+
+https://www.zhihu.com/tardis/bd/art/701600502?source_id=1001
 
 ##### 筛选高质量sft数据
+
+==高质量，有噪声 都对模型训练有帮助==
 
 （1） sft数据的清洗
 
@@ -2738,9 +3114,10 @@ https://github.com/alibaba/data-juicer
 
 （2）通过IFD指标筛选sft数据
 
-###### ├─ [From Quantity to Quality](https://arxiv.org/pdf/2308.1203)
+###### ├─ [From Quantity to Quality](https://arxiv.org/pdf/2308.12032)
 
 提出一个指令跟随难度（Instruction-Following Difficulty，IFD）指标，通过该指标来筛选具有增强LLM指令调优潜力的数据样例（樱桃数据，cherry data），而模型仅使用原始数据5%-10%的cherry数据就可以达到全量数据微调的效果，甚至可以有所提高。
+![74340266367](assets/1743402663673.png)
 
 【==启发思想==】
 
@@ -2762,11 +3139,15 @@ https://github.com/alibaba/data-juicer
 
 对类中心的数据点排序->如果某个类数据不够，全采->获取这个类别的的置信度，置信度来自于样本的ppl值->获取最低的ppl阈值和最大的阈值->将最低阈值和最大阈值之间的数据作为中间数据上->如果中间阈值过滤数据量不够采样数量，则全部使用->否则切分成n份进行采样
 
-##### 评估sft数据质量和数量
+###### ├─ [SuperFiltering](https://arxiv.org/pdf/2402.00530)
 
-├─ SuperFiltering
+###### ├─ [MoDS](https://arxiv.org/pdf/2402.18191)
 
+###### ├─ [CaR](https://github.com/IronBeliever/CaR)
 
+###### ├─ [Nuggets](https://arxiv.org/pdf/2312.10302)
+
+###### ├─ [LESS](https://arxiv.org/pdf/2402.04333)
 
 #### Pretrain数据筛选策略
 
@@ -2800,13 +3181,25 @@ https://github.com/alibaba/data-juicer
 
 ### 数据过滤
 
+
+
+基于人为设定的规则过滤
+
+【方法】粗糙集、Ripper、决策树和Boosting
+
+【特点】方法效率较高，规则库可以共享，推广性很强。但是，规则库庞大需要维护，规则更新时效差，在无规则的平台适用度低。
+
+基于统计机器学习的过滤技术
+
+【方法】朴素贝叶斯、逻辑回归、支持向量机、KNN、神经网络、随机森林
+
+【特点】准确率较高、速度较快、人工成本低
+
+
+
 制定文档质量评估标准，过滤低质量内容
 
 保留数学、代码等低资源领域知识
-
-###### ├─ SuperFiltering
-
-###### ├─ Cherry LLM
 
 ###### ├─ Language Filtering
 
@@ -3152,7 +3545,9 @@ $\hat{A}_t^{\text{GAE}(\gamma,\lambda)}(\tau) = (1 - \lambda)(\hat{A}_t^{(1)} + 
 
 $\delta_{t+l}^V=r_t+\gamma V(s_{t+1}-V(s_{t})$
 
- $\lambda=0$：采样次数少，偏差小，方差大； $\lambda=1$：采样次数多，偏差大，方差小
+ $\lambda=0(蒙特卡罗汇报)$：采样次数少，偏差小，方差大；
+
+ $\lambda=1(时序差分)$：采样次数多，偏差大，方差小
 
 
 
@@ -3192,7 +3587,7 @@ $\delta_{t+l}^V=r_t+\gamma V(s_{t+1}-V(s_{t})$
 
 **环节三：计算优势函数$A_t$和状态价值函数$Q$**—提供细粒度反馈信号，用于指导优化
 
-优势函数通常用于评估在特定状态下采取某个动作比遵循当前策略（Policy）更好或更差的程度。主要用途是优化策略，帮助模型明确地了解哪些动作（哪个Token）在当前状态（已生成的token）下是有利的。get_advantages_and_returns() 函数
+优势函数通常用于评估在特定状态下采取某个动作比遵循当前策略（Policy）更好或更差的程度。主要用途是优化策略，帮助模型明确地了解哪些动作（哪个Token）在当前状态（已生成的token）下是有利的。get_advantages_and_returns() /compute advantages()函数
 
 关键要点：优势函数的计算必须准确，否则会误导优化；Q 的评估需要结合critic_model 和奖励信号的准确性。
 
@@ -3270,8 +3665,7 @@ $$
 = \mathbb{E}_{(s_t, a_t) \sim \pi_{\theta'}} \left[ \frac{\pi_\theta(s_t,a_t)}{\pi_{\theta'}(s_t,a_t)}A_{\pi_{\theta}}(s_t, a_t) \frac{\nabla\pi_\theta(s_t,a_t)}{\pi_\theta(s_t,a_t)} \right]\\
 （\nabla logf(x)=\frac{\nabla f(x)}{f(x)}）\\
 = \mathbb{E}_{(s_t, a_t) \sim \pi_{\theta'}} \left[ \frac{\nabla\pi_\theta(s_t,a_t)}{\pi_{\theta'}(s_t,a_t)}A_{\pi_{\theta}}(s_t, a_t) \right]\\
-= \mathbb{E}_{(s_t, a_t) \sim \pi_{\theta_{old}}} \left[ \frac{\nabla\pi_\theta(s_t,a_t)}{\pi_{\theta'}(s_t,a_t)}A_{\pi_{\theta}}(s_t, a_t) \right]\\
-(\theta'=\theta_{old})\\
+= \mathbb{E}_{(s_t, a_t) \sim \pi_{\theta_{old}}} \left[ \frac{\nabla\pi_\theta(s_t,a_t)}{\pi_{\theta'}(s_t,a_t)}A_{\pi_{\theta}}(s_t, a_t) \right](\theta'=\theta_{old})\\
 \mathcal{L}_{PPO}=-\nabla_{\theta} J(\theta)
 $$
 此时存在局限性：这个参考（小明）不能和你要训练的（周围学生）差距太大，不然你很难学到对你有用的经验和教训。(举例差距太大：小明考试交白卷，你交白卷几乎概率为0；比如小明是坏学生，上课不听课也没骂老师，老师表扬他，对你也没有意义，因为你不骂老师)
@@ -3312,7 +3706,7 @@ $\epsilon$：剪切范围超参数，通常设为 0.1 或 0.2。
 
 **基准模型(Reference LLM)**：LM_head=hidden_size × vocab_size
 
-**训练模型(Actor LLM)**：模型结构=基准模型。也是PPO优化目标。LM_head=h_s × v_s
+**训练模型(Actor LLM)**：【负责生成动作】模型结构=基准模型。也是PPO优化目标。LM_head=h_s × v_s
 
 **奖励模型(Reward LLM)**：先通过AutoModelForSequenceClassification加载模型，再通过RewardTrainer训练出一个奖励模型。 Score_head=h_s × 1
 
@@ -3320,7 +3714,7 @@ $\epsilon$：剪切范围超参数，通常设为 0.1 或 0.2。
 
 <img src="assets/1741164572298.png" style="zoom:50">
 
-**状态价值模型(State-Value Model,critic_model)**：对每个状态评估价值，即截止到目前token序列预测到序列生成结束后，这个问答序列期望回报是多少。Value_head=h_s × 1
+**状态价值模型(State-Value Model,critic_model)**：【指导策略更新方向】对每个状态评估价值，即截止到目前token序列预测到序列生成结束后，这个问答序列期望回报是多少。Value_head=h_s × 1
 
 **问题**：直接加载四个大模型，显存爆炸。
 
@@ -3367,6 +3761,10 @@ DPO相较于RLHF更容易实现、易于训练、效果更好、稳定、高效�
 直接优化策略以匹配人类偏好，无需显式奖励函数。
 
 【公式】
+
+DPO 的作者观察到，奖励函数r(x,y) 可以用策略 $\pi_\theta(y|x)$ 本身来表示。
+
+![74236840753](assets/1742368486433.png)
 
  $\mathcal{L}_{DPO}(\pi_\theta;\pi_{ref}) = - \mathbb{E} _{(x,y_w,y_l)~D}[log\sigma(\beta log\frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_l|x)}-\beta log\frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_w|x)})]$
 
@@ -3435,6 +3833,10 @@ dpo_trainer.save_model()
 这样一来，虽然「好坏答案」之间的概率差变大了，但这个过程中「好答案」被采样的概率也降低了
 这种情况在chosen和rejected答案有大部分内容相同，仅有少部分内容不同时较为常见
 
+1. 对偏好数据质量的强依赖性：DPO的性能高度依赖偏好数据的质量和多样性。可能导致模型在真实场景中表现不稳定
+2. 泛化能力受限：DPO的优化目标直接拟合现有偏好数据，可能过度适应训练集中的特定模式，而非学习通用的“优质回答”原则。
+3. 多轮对话场景的挑战：DPO通常针对单轮偏好数据优化，而多轮对话需要维护上下文一致性，这对偏好数据的标注和模型训练提出了更高要求。
+
 ##### ├─ RPO
 
 ##### ├─ TDPO
@@ -3461,9 +3863,9 @@ $\mathcal{L}_{ORPO}(\pi_\theta;\pi_{ref}) = \mathbb{E} _{(x,y_w,y_l)~D}[\mathcal
 
 $\mathcal{L}_{SFT}=MSE=\frac{1}{N}\sum_{i=1}^N(y_i-\hat{y}_i)^2$
 
-$odds_\theta(y|x)=\frac{P_\theta(y|x)}{1-P_\theta(y|x)}$
-
 $\mathcal{L}_{OR}=-log\sigma \left( log\frac{odds_\theta(y_w|x)}{odds_\theta(y_l|x)}\right)$
+
+$odds_\theta(y|x)=\frac{P_\theta(y|x)}{1-P_\theta(y|x)}$
 
 【存在问题】
 
@@ -3479,21 +3881,55 @@ $\mathcal{L}_{OR}=-log\sigma \left( log\frac{odds_\theta(y_w|x)}{odds_\theta(y_l
 
 **GRPO（Group Relative Policy Optimization，群组相对策略优化）**：GRPO 是多智能体强化学习算法，用群体相对奖励衡量个体表现，消除绝对奖励干扰，专注优化群体内相对表现。
 
+【相比PPO改进】
+
+1. **消除Critic模型**。PPO需要Critic模型评估每个动作（生成的 token 或序列）的预期回报，计算优势函数（Advantage）。GRPO则改用**组内相对比较**来估计优势。
+
+2. **组的相对优势估计**。PPO采用广义优势估计GAE来计算相对优势。GRPO简化了这一过程。GRPO 针对每个 Prompt 生成一组输出（例如 4-8 个响应），然后用奖励模型对所有输出评分，然后组内减去baseline,计算相对优势。
+
+3. **更高效的计算和内存使用**。PPO 需要为**每个 token** 或序列计算奖励和价值估计，计算量和内存需求随序列长度增加而增加。GRPO 只依赖奖励模型对一组完整输出评分，**不需要 token 级别**的价值估计。
+
+4. **KL散度直接融入损失函数**。PPO使用KL散度防止Actor_Model偏离参考模型太远。GRPO则将KL加入到损失函数中，来平衡性能和策略稳定。
+
+5. **适合复杂推理任务**。GRPO 鼓励模型生成多样化输出并从中学习最佳策略，提升了推理能力和输出质量。
+
+   PPO优点：业内成熟，广泛应用于 RLHF
+
+   ​	缺点：资源需求高，训练复杂不稳定
+
+   GRPO优点：高效、简单，显著降低训练成本，同时在推理任务中表现更优。
+
+   ​	缺点：依赖组内多输出的质量，可能对奖励模型的设计更敏感。
+
 【公式】
 $$
-J_{\text{GRPO}}(\theta) = \frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}\left[ \min \left( \frac{\pi_{\theta}(o_{i,t} | q_i, o_{i, <t})}{\pi_{\text{old}}(o_{i,t} | q_i, o_{i, <t})} \hat{A}_{i,t}, \text{clip}\left( \frac{\pi_{\theta}(o_{i,t} | q_i, o_{i, <t})}{\pi_{\text{old}}(o_{i,t} | q_i, o_{i, <t})} \right) (1 - \epsilon, 1 + \epsilon) \hat{A}_{i,t} \right)\\ - \beta D_{\text{KL}}[\pi_{\theta} \| \pi_{\text{ref}}] \right]\\
-D_{KL}=x -logx -1\\
-Ai = (r_i - mean)/std
+J_{\text{GRPO}}(\theta) = \frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}\left[ \min \left( \frac{\pi_{\theta}(o_{i,t} | q_i, o_{i, <t})}{\pi_{\text{old}}(o_{i,t} | q_i, o_{i, <t})} \hat{A}_{i,t}, \text{clip}\left( \frac{\pi_{\theta}(o_{i,t} | q_i, o_{i, <t})}{\pi_{\text{old}}(o_{i,t} | q_i, o_{i, <t})},1 - \epsilon, 1 + \epsilon\right) \hat{A}_{i,t} \right) \\ - \beta D_{\text{KL}}[\pi_{\theta} \| \pi_{\text{ref}}] \right]\\
+D_{KL}[\pi_\theta||\pi_{ref}]=\frac{\pi_{ref}(o_{i,t} | q_i, o_{i, <t})}{\pi_{\theta}(o_{i,t} | q_i, o_{i, <t})} -log\frac{\pi_{ref}(o_{i,t} | q_i, o_{i, <t})}{\pi_{\theta}(o_{i,t} | q_i, o_{i, <t})} -1\\
+A_i = (r_i - mean)/std\\
+r_t = r_{\varphi}(q, o_{\leq t}) - \beta \log \frac{\pi_{\theta}(o_t | q, o_{<t})}{\pi_{\text{ref}}(o_t | q, o_{<t})}
 $$
 其中：
 - $G $是每个提示的生成次数。
-- $o_i$是第$i$个提示的生成，$|o_i|$ 是$o_i$中 token 的数量。
+
+- $o_i$是第$i$个提示的生成，$|o_i|$ 表示序列长度。
+
 - $q_i $是提示。
+
 - $\pi_{\theta}$ 是策略模型。
+
 - $\pi_{\text{old}}$是更新前的策略模型。
+
 - $\pi_{\text{ref}}$ 是参考策略。
+
 - $\hat{A}_{i,t}$是第$ i$ 个生成中第$t$个 token 的优势估计。
+
 - $\epsilon$ 和 $\beta$是超参数。
+
+  https://www.bilibili.com/video/BV1enQLYKEA5
+
+【最大化目标 】最大化策略模型对优质输出的信心以及最小化对劣质输出的信心;
+
+l两个正则化要素：一个隐式正则化要素是用min和clip限制策略比值范围防止新旧策略差别过大；另一个显式正则化就是KL散度用于约束新策略和原始策略或者说参考模型差异过大
 
 【流程】
 
@@ -3504,6 +3940,18 @@ $$
 根据组内奖励计算均值和标准差，然后计算每个样本的相对奖励，然后结合KL进行策略优化。
 
 ![74118154122](assets/1741181541224.png)
+
+【参考】
+
+https://mp.weixin.qq.com/s?__biz=MzI1MjQ2OTQ3Ng==&mid=2247652938&idx=2&sn=960b4585fe71c3353580785fb62f282a&chksm=e9ef9fc1de9816d78d927f129c964dc2795117a51d49382cc25e78963426696f4a362a33fe2a&scene=27
+
+### [VeRL框架](https://arxiv.org/pdf/2409.19256)
+
+【参考】
+
+https://zhuanlan.zhihu.com/p/27676081245
+
+### OpenRLHF框架
 
 # 模型⭐⭐
 
@@ -3523,6 +3971,7 @@ $$
 - **Segment Embeddings:** 由于BERT能够处理两个句子作为输入（例如，在句子对分类任务中），因此需要一种方法来区分两个句子。该向量的取值在模型训练过程中自动学习。
 - 遮蔽语言模型（MLM）通过随机遮蔽输入词元并预测被遮蔽的词元，实现了深度双向表示的学习，有助于模型捕获丰富的上下文信息，**但预训练与微调间存在不匹配，通过混合使用[MASK]、随机词元和原词元来缓解这一问题。**
 - 下一句预测（NSP）任务通过预测句子对是否连续，**帮助BERT模型理解句子间的关系**，对问答和自然语言推理等任务非常有益，且BERT将所有参数转移到下游任务以初始化模型参数。
+- 激活函数：`GeLU`
 
 
 https://blog.csdn.net/2401_84033492/article/details/137657486
@@ -3711,6 +4160,36 @@ ChatGLM 3与ChatGLM 2相比，模型架构完全一致。
 
 https://zhuanlan.zhihu.com/p/695112177
 
+#### 迭代
+
+###### ├─ [Qwen]([2309.16609](https://arxiv.org/pdf/2309.16609))
+
+- **嵌入和输出投影：** `untied embedding` 。而不是将 input embedding 和 output projection 的权重捆绑在一起。**做出此决定是为了以内存成本的价格获得更好的性能。**
+- **分词器**：采用`BBPE`，使用SentencePiece 实现
+- **位置编码**：`RoPE`
+- **注意力机制：**`FlashAttention` +`启用bias`(**增强模型的外推能力**).
+- **正则化**：`RMSNorm`。
+- **激活函数**：`SwiGLU`
+- **上下文长度扩展：**`NTK-aware`
+
+├─ [Qwen2]()
+
+① 模型架构优化：
+
+- **注意力机制**：`Qwen2FlashAttention2` 和 `Qwen2SdpaAttention`：两种注意力机制的变体。
+- **引入MOE**：更强的长上下文建模能力
+
+② 训练数据：
+
+- **数据多样性增强**：扩展了多模态数据（如图文对、音视频描述），支持更复杂的跨模态任务。
+- **多语言支持**：新增对低资源语言的支持，提升小语种任务的性能。
+
+
+
+├─ [Qwen2.5]([2412.15115](https://arxiv.org/pdf/2412.15115?))
+
+
+
 ## 3.5 [Deepseek][40]
 
 #### 模型架构及技术细节
@@ -3770,6 +4249,11 @@ https://zhuanlan.zhihu.com/p/695112177
 
 MLA
 
+优势：
+MTP目标可以增加训练信号，提高数据利用率；
+MTP可能使模型能够提前规划其表示，从而更好地预测未来Token;
+![74299797815](assets/1742998033854.png)
+
 DeepseekMoE
 
 辅助损失负载平衡：专家层面平衡损失、设备层面平衡损失、通信层面平衡损失
@@ -3780,7 +4264,7 @@ Token丢弃策略：在训练时，首先计算每台机器的平均计算预算
 
 GRPO：
 
-├─ [Deepseek V3]
+├─ [Deepseek V3](https://arxiv.org/pdf/2412.19437)
 
 无辅助损失的负载均衡策略
 
@@ -3804,13 +4288,13 @@ GRPO：
 
 1.deepseek进行预训练，得到<u>deepseek v3-base</u>
 
-2.构造<u>少量long-cot数据</u>对deepseek v3-base进行sft，得到<u>sft model</u>
+2.构造<u>少量long-cot数据</u>对deepseek v3-base进行sft，得到<u>sft model</u>(少量long-cot数据是通过deepseek r1-zero生成)
 
 3.对sft model 进行强化学习得到<u>RL model</u>
 
-4.对以上RL model进行拒绝采样，获取部分<u>蒸馏数据A</u>
+4.对以上RL model进行拒绝采样，获取部分<u>推理数据A</u>
 
-5.将<u>蒸馏数据A</u>和<u>少量long-cot数据</u>在<u>deepseek v3-base</u>进行混合训练得到 <u>sft model2</u>
+5.将 <u>推理数据A、V3的SFT数据、面向非推理数据的V3COT采样数据</u> 在<u>deepseek v3-base</u>进行混合训练得到 <u>sft model2</u>
 
 6.对sft model2 进行价值对齐（有用性、无害性、多场景）的RLHF得到最终的<u>R1</u>
 
@@ -3826,31 +4310,32 @@ GRPO：
 
 ![74230992672](assets/1742309926722.png)
 
+![74297383434](assets/1742973834345.png)
+
 # 评估
 
-## 模型评估指标
+## 数据集评估
 
-预训练：用 Perplexity 和 MMLU 评估通用能力，目标 Perplexity < 6，MMLU > 70%。
+数据多样性
+数据平衡性
+数据完整性
+数据一致性
+数据与任务的适合性
+标注准确性
 
-SFT/DPO：用 BLEU、Win Rate 和 IFEval 评估生成质量，目标 Win Rate > 70%，IFEval > 90%。
+## 预训练评估
 
-推理优化：用 Latency（< 50ms/token）和 Throughput（> 500 TPS）优化部署。
+### 评估指标
 
-安全监控：用 G-Eval 和 LlamaGuard 2 确保内容合规，评分 > 4/5。
+#### 基础语言能力
 
-### 语言建模能力
+##### PPL, Perplexity
 
-#### PPL, Perplexity
+【**定义**】可以看作是模型不确定性的度量，值越低表示模型越能准确地预测下一个单词。反映了模型对语言分布的掌握程度
 
-【定义】
+【**公式**】
 
-- PPL是语言模型对测试文本中每个token预测概率的几何平均数的倒数。
-- PPL可以看作是模型不确定性的度量，值越低表示模型越能准确地预测下一个单词。
-- PPL本质反映了模型的复杂性和信息量。
-
-【公式】
-
-$PPL = \text{exp}(2^{-\frac{1}{N}\sum_{i=1}^Nlog_2P(w_i)})$
+​	$PPL = \text{exp}(2^{-\frac{1}{N}\sum_{i=1}^Nlog_2P(w_i)})$
 
 $N$：测试样本中的总token数。
 
@@ -3858,13 +4343,12 @@ $P(w_i)$：模型对第$i$个token的预测概率。
 
 【困惑度和交叉熵的关系】
 
-$PPL={2/e}^H$
+​	$PPL={2/e}^H$
 
-**交叉熵** 衡量的是模型预测分布与真实数据分布之间的不匹配程度。交叉熵值越小，表示模型预测越准确。
+- 交叉熵衡量的是模型预测分布与真实数据分布之间的不匹配程度。交叉熵值越小，表示模型预测越准确。
+- 困惑度表示模型在预测下一个词时的平均不确定度。它是交叉熵的指数，因此也反映了模型的预测性能。困惑度越低，表示模型对下一个词的预测越有把握。
 
-**困惑度** 表示模型在预测下一个词时的平均不确定度。它是交叉熵的指数，因此也反映了模型的预测性能。困惑度越低，表示模型对下一个词的预测越有把握。
-
-【性质】
+【**性质**】
 
 对于高质量数据集，如果模型预测的PPL越小，则模型的性能越好。对于低质量数据集，则未必。
 
@@ -3878,7 +4362,233 @@ $PPL={2/e}^H$
 
 **受词汇表大小和分词方式影响**：不同的分词方法和词汇表规模会影响PPL的计算。较大的词汇表可能增加模型的PPL，因为稀有词的预测更具挑战性。
 
+【**局限性**】无法直接反应生成文本的质量或逻辑性
 
+##### TPA, Token prediction Accurary
+
+【定义】模型预测下一个Token的准确率，常用于验证
+
+【适用场景】常用于验证预训练阶段的局部优化效果
+
+#### 下游任务表现
+
+##### Zero-Shot/Few-Shot准确率
+
+【适用场景】常用于评估其泛化能力
+
+#### 知识掌握与推理
+
+##### FA, Factual Accurary
+
+【适用场景】通过问答任务（TriviaQA）验证模型对世界知识的掌握
+
+##### 逻辑推理能力
+
+数学推理(GSM8K)、常识推理任务(HellaSwag)中的准确率
+
+#### 生成质量
+
+##### 多样性、连贯性、相关性
+
+人工或自动化指标（如BLEU、ROUGE）评估生成文本的质量。
+
+#### 效率指标
+
+##### 训练速度（Tokens/Sceond）
+
+##### 显存占用与推理延迟
+
+#### 安全性
+
+对有害内容生成、偏见、幻觉(Hallucination)的抵抗能力，通过TruthfulQA等基准测试评估。
+
+人类评估
+
+
+
+## SFT评估
+
+### 任务相关指标
+
+#### 分类/判别任务
+
+##### Accurary
+
+##### F1-Score
+
+对不平衡数据更鲁棒
+
+##### AUC-ROC
+
+评估模型对类别排序能力，适用于概率输出任务（如情感分析）。
+
+#### 生成任务
+
+##### BLEU
+
+基于n-gram匹配，常用于机器翻译或文本摘要，但对语义多样性敏感。
+
+##### ROUGE
+
+通过召回率评估生成内容与参考文本的重叠度，适合长文本生成。
+
+ROUGE-L：衡量模型生成文本与参考文本之间最长公共子序列
+
+##### METEOR
+
+引入词义匹配（如同义词）和句法结构，比BLEU更贴近人类评分。
+
+#### 代码任务
+
+##### Pass@k
+
+##### CodeBLEU
+
+### 通用指标
+
+##### PPL
+
+##### 指令遵循率
+
+对用户指令（如格式、内容约束）的遵守程度，需人工或规则判定（如AlpacaEval)。
+
+##### Distinct-n, 多样性
+
+生成文本的词汇多样性，避免重复或模板化响应。
+
+### 人类评估
+
+##### 质量评分
+
+由专家或众包人员打分（常用1-5 Likert量表）
+
+##### 对比评估
+
+（直接对比SFT前后模型输出的优劣（A/B Test）。
+
+### 评估方法
+
+#### 任务内测试
+
+Zero-Shot：直接使用SFT后模型在测试集上预测，评估任务适配性。
+Few-Shot：提供少量示例(In-Context Learning》，测试模型泛化能力。
+
+#### 跨领域泛化测试
+
+在未参与SFT的领域数据上测试模型表现，验证是否过拟合。
+
+#### 能力退化检测
+
+对比SFT前后模型在通用任务（如常识推理、多轮对话）上的表现，避免灾难性遗忘。
+
+#### 对抗测试
+
+构造边缘案例（如模糊指令、对抗性输入），测试模型鲁棒性。
+
+### 常用Benchmark
+
+| Benchmark  | 场景       | 评估重点                    | Qwen适配示例                      |
+| ---------- | ---------- | --------------------------- | --------------------------------- |
+| MMLU       | 多学科问答 | 57个学科领域的准确率        | 测试SFT后模型的知识广度和推理能力 |
+| HumanEval  | 代码生成   | Python 函数生成的 Pass@k    | 评估代码生成和逻辑实现能力        |
+| AlpacaEval | 指令跟随   | 对比 GPT-4 的胜率 (WinRate) | 验证指令理解与执行质量            |
+| MT-Bench   | 多轮对话   | 多轮交互的连贯性和信息量    | 测试对话场景的SFT优化效果         |
+| GSM8K      | 数学推理   | 多步骤数学问题解决准确率    | 验证逻辑推理能力提升              |
+| TruthfulQA | 真实性     | 生成答案的真实性（避免幻觉) | 检测SFT 后模型的可靠性            |
+
+### 评估实践：
+
+将数据集分为分为：7：2：1
+
+定量评估：ROUGE 指标、BLEU 指标、F1
+
+定性评估：让医生评估
+
+鲁棒性测试：没做（长文本处理）
+
+对比：与基线模型比较性能。
+
+
+
+
+
+
+
+
+
+
+
+## RAG评估
+
+### 评估指标
+
+#### 召回指标
+
+##### 召回率@K
+
+人工标注测试集，统计Top-K结果中的相关文档数
+
+##### 准确率@K
+
+基于测试问题，判断Top-K结果是否包含答案
+
+##### 上下文召回率
+
+##### 上下文相关性
+
+衡量从知识库中检索出的上下文信息于用户问题的相关程度。
+
+#### 排序指标
+
+##### MRR， Mean Reciprocal Rank
+
+【定义】平均倒数排序：相关文档的排名倒数的平均值。
+
+##### NDCG@K, Normalized Discounted Cumulative Gain
+
+【定义】同时结合了文档的相关性和它们的排名位置，用于衡量排序质量。
+
+#### 生成指标
+
+##### 答案准确性
+
+使用Rouge-L/BLEU-4，或人工评分（0-5分制）
+
+##### 答案相关性
+
+人工标注（相关/部分相关/不相关）
+
+#### 整体指标
+
+回答完整性
+
+平均响应时间
+
+
+
+RLHF评估
+
+Agent评估
+
+Prompt评估
+
+Benckmark
+
+评估指标汇总
+
+
+
+## 模型评估指标
+
+预训练：用 Perplexity 和 MMLU 评估通用能力，目标 Perplexity < 6，MMLU > 70%。
+
+SFT/DPO：用 BLEU、Win Rate 和 IFEval 评估生成质量，目标 Win Rate > 70%，IFEval > 90%。
+
+推理优化：用 Latency（< 50ms/token）和 Throughput（> 500 TPS）优化部署。
+
+安全监控：用 G-Eval 和 LlamaGuard 2 确保内容合规，评分 > 4/5。
+
+### 
 
 ### 生成质量
 
