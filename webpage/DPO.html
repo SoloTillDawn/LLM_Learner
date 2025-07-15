@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>我的 DPO 参数理解</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        p {
+            color: #666;
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>DPO超参数</h1>
+<h2>主要超参数</h2>
+
+        <p><strong>max_prompt_length（最大提示长度）：</strong>  
+        这个参数指定了输入提示的最大长度（通常以 token 数计）。它限制了模型处理输入的上下文长度，确保在推理或训练时不会超过模型支持的上下文窗口（例如 2048 或 4096 tokens）。设置较小的值可以减少内存使用和计算成本，但可能丢失重要上下文；设置较大的值适合长序列任务，但可能增加计算开销。</p>
+        
+        <p><strong>max_length（最大输出长度）：</strong>  
+        定义了模型生成响应的最大 token 数。DPO 优化偏好时，需要生成候选输出进行比较，这个参数确保生成长度控制在合理范围内。过短可能限制生成质量，过长可能导致无关信息或资源浪费。通常与 `max_prompt_length` 结合使用，构成总上下文长度。</p>
+        
+        <p><strong>per_device_train_batch_size（每设备训练批次大小）：</strong>  
+        指定每个 GPU 或设备的训练批次大小。DPO 通常需要较小的批次大小以避免内存溢出，但过小可能影响训练稳定性。工业实践中，值可能从 1 到 16 不等，具体取决于模型大小和硬件资源。</p>
+        
+        <p><strong>per_device_eval_batch_size（每设备评估批次大小）：</strong>  
+        类似训练批次大小，但用于评估阶段。评估通常需要更小的批次，以确保推理过程稳定且资源占用可控，通常与训练批次大小一致或更小。</p>
+        
+        <p><strong>max_steps（最大训练步数）：</strong>  
+        控制训练的总步数，而不是基于 epoch。DPO 通常在较少步数内收敛（例如 100-1000 步），因此需要根据数据规模和模型复杂度调整，防止过拟合或欠拟合。</p>
+        
+        <p><strong>learning_rate（学习率）：</strong>  
+        DPO 的学习率通常较小（例如 1e-5 或 5e-6），因为它优化的是偏好对（preference pairs），直接调整模型参数。需要通过实验（如学习率调度）找到最佳值，避免梯度爆炸或收敛过慢。</p>
+
+
+<h2>次要超参数</h2>
+        
+    </div>
+</body>
+</html>
