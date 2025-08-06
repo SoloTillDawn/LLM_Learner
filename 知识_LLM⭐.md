@@ -756,7 +756,41 @@ Adam的更新公式：$\theta_{t+1}=\theta_t-\eta\frac{\alpha\hat{m}_t}{\sqrt{\h
 AdamW：梯度更新中加入$\lambda\theta_{t-1}$是L2正则化莫不是权重衰减，他认为权重衰减是：$\theta_{t+1}=\theta_t-\eta(\frac{\alpha\hat{m}_t}{\sqrt{\hat{v}_t}+\epsilon}+\lambda\theta_{t-1})$
 
 
+###### ├─ Muon
+Muon全称是“MomentUm Orthogonalized by Newton-schulz”，是一个类似于Adam的自适应学习率优化器。
+<img src='assets/Snipaste_2025-08-06_19-37-26.png' style='zoom:70'>
+import jax
+import jax.numpy as jnp
+from tqdm import tqdm
 
+n, m, T = 1024, 1024, 5
+key, data = jax.random.key(42), jnp.array([])
+for _ in tqdm(range(1000), ncols=0, desc='SVD'):
+    key, subkey = jax.random.split(key)
+    M = jax.random.normal(subkey, shape=(n, m))
+    S = jnp.linalg.svd(M, full_matrices=False)[1]
+    data = jnp.concatenate([data, S / (S**2).sum()**0.5])
+
+@jax.jit
+def f(w, x):
+    k, x1, x2 = w
+    for _ in range(T):
+        x = x + k * x * (x**2 - x1**2) * (x**2 - x2**2)
+    return ((x - 1)**2).mean()
+
+f_grad = jax.grad(f)
+w, u = jnp.array([1, 0.9, 1.1]), jnp.zeros(3)
+for _ in tqdm(range(100000), ncols=0, desc='SGD'):
+    u = 0.9 * u + f_grad(w, data)  # 动量加速
+    w = w - 0.01 * u
+
+k, x1, x2 = w
+a, b, c = 1 + k * x1**2 * x2**2, -k * (x1**2 + x2**2), k
+print(f'{n} & {m} & {T} & {k:.3f} & {x1:.3f} & {x2:.3f} & {a:.3f} & {b:.3f} & {c:.3f} & {f(w, data):.5f}')
+
+参考
+https://kexue.fm/archives/10592、https://kexue.fm/archives/10996
+https://github.com/KellerJordan/Muon
 
 
 ### 1.3.2 解码策略
