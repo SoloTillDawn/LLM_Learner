@@ -218,6 +218,116 @@ tmp.popleft()# 弹出左边第一个，注意 pop() 内部不能有参数
 
 #####  pydantic
 
+##### callback
+当程序运行是，一般情况下，应用程序会时常通过API调用库里所预先备好的函数。但是有些库函数却要求应用先传给它一个函数，好在合适的时候调用，以完成目标任务。这个被传入的、后又被调用的函数就称为回调函数（callback function）
+简单例子
+```
+def my_callbcak(args):
+    print(*args)
+
+def caller(args, func):
+    func(args)
+
+caller((1,2), my_callbcak)
+
+结果：
+# 1 2
+```
+##### @wraps(func)
+Python装饰器（decorator）在实现的时候，被装饰后的函数其实已经是另外一个函数了（函数名等函数属性会发生改变），为了不影响，Python的functools包中提供了一个叫wraps的decorator来消除这样的副作用。
+```
+from functools import wraps   
+def my_decorator(func):
+    def wrapper(*args, **kwargs):
+        '''decorator'''
+        print('Calling decorated function...')
+        return func(*args, **kwargs)
+    return wrapper  
+ 
+@my_decorator 
+def example():
+    """Docstring""" 
+    print('Called example function')
+print(example.__name__, example.__doc__)
+# ('wrapper', 'decorator')
+
+from functools import wraps   
+def my_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        '''decorator'''
+        print('Calling decorated function...')
+        return func(*args, **kwargs)
+    return wrapper  
+ 
+@my_decorator 
+def example():
+    """Docstring""" 
+    print('Called example function')
+print(example.__name__, example.__doc__)
+# ('example', 'Docstring')
+```
+带上参数的回调函数
+```
+def appy_async(func, args, *, callback):
+    result = func(*args)
+    #异步执行的函数 同时将执行后返回到这个早从这个函数跳出去
+    callback(result)
+ 
+def add(x ,y):
+    return x + y
+ 
+class ResultHandler(object):
+    def __init__(self):
+        self.sequence = 0
+ 
+    def handle(self, result):
+        self.sequence += 1
+        print("[{}] Got: {}".format(self.sequence, result))
+ 
+resultHandler = ResultHandler()
+appy_async(add, (2,3), callback=resultHandler.handle)
+```
+使用闭包代替上面的类来实现
+```
+def apply_async(func, args, *, callback):
+    result = func(*args)
+    callback(result)
+  
+def add(x ,y):
+    return x + y
+  
+def make_handler():
+    sequence = 0
+    def handler(result):
+        nonlocal sequence
+        sequence += 1
+        print("[{}] Got:{}".format(sequence, result))
+    return handler
+  
+handler = make_handler()
+apply_async(add, (2,3), callback=handler)
+```
+使用协程
+```
+def apply_async(func, args, *, callback):
+    result = func(*args)
+    callback(result)
+
+def add(x, y):
+    return x + y
+
+def make_handler():
+    sequence = 0
+    while True:
+        result = yield
+        sequence += 1
+        print("[{}] Got:{}".format(sequence, result))
+
+handle = make_handler()
+next(handle)
+apply_async(add, (2,3), callback=handle.send)
+```
 
 # 算法
 
