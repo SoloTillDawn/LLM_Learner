@@ -3979,6 +3979,63 @@ l两个正则化要素：一个隐式正则化要素是用min和clip限制策略
 
 https://mp.weixin.qq.com/s?__biz=MzI1MjQ2OTQ3Ng==&mid=2247652938&idx=2&sn=960b4585fe71c3353580785fb62f282a&chksm=e9ef9fc1de9816d78d927f129c964dc2795117a51d49382cc25e78963426696f4a362a33fe2a&scene=27
 
+### [GSPO](https://arxiv.org/pdf/2507.18071)
+```
+import torch
+
+per_token_logps = torch.tensor([[-1.0, -0.5, -0.2]]) # 每个 token 的新模型 log 概率
+old_per_token_logps = torch.tensor([[-1.2, -0.4, -0.3]]) # 每个 token 的旧模型 log 概率
+completion_mask = torch.tensor([[1, 1, 1]]) # mask 1 表示有效 token，0 表示 padding
+
+# GRPO
+log_ratio = per_token_logps - old_per_token_logps # 每个token的log概率差
+# [-1.0 - (-1.2), -0.5 - (-0.4), -0.2 - (-0.3)]
+# [0.2, -0.1, 0.1]
+log_importance_weights = log_ratio  # 保留token级粒度
+coef_1 = torch.exp(log_importance_weights)  # 每个token的概率比
+# exp([0.2, -0.1, 0.1]) ≈ [1.2214, 0.9048, 1.1052]
+
+# GSPO
+log_ratio = per_token_logps - old_per_token_logps # 每个token的log概率差
+# 同上: [[0.2, -0.1, 0.1]]
+# 按句子平均：总log概率差 / 有效token数（避免padding影响））
+log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1)
+# sum: (0.2 + (-0.1) + 0.1) = 0.2
+# 平均: 0.2 / 3 ≈ 0.0667
+log_importance_weights = log_importance_weights.unsqueeze(-1) # 扩展为(batch_size, 1)
+# 变成 [[0.0667]]
+coef_1 = torch.exp(log_importance_weights)  # 整个句子的平均概率比
+# exp(0.0667) ≈ 1.069
+```
+$$
+\mathcal{J}_{\text{GRPO}}(\theta) = \mathbb{E}_{x \sim \mathcal{D}, \{y_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(\cdot | x)} \left[ \frac{1}{G} \sum_{i=1}^G \frac{1}{|y_i|} \sum_{t=1}^{|y_i|} \min \left( w_{i,t}(\theta) \widehat{A}_{i,t}, \text{clip} \left( w_{i,t}(\theta), 1 - \varepsilon, 1 + \varepsilon \right) \widehat{A}_{i,t} \right) \right]\\
+w_{i,t}(\theta) = \frac{\pi_{\theta}(y_{i,t} | x, y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t} | x, y_{i,<t})}, \quad \widehat{A}_{i,t} = \widehat{A}_i = \frac{r(x, y_i) - \text{mean} \left( \{ r(x, y_i) \}_{i=1}^G \right)}{\text{std} \left( \{ r(x, y_i) \}_{i=1}^G \right)}
+$$
+
+$$
+\mathcal{J}_{\text{GSPO}}(\theta) = \mathbb{E}_{x \sim \mathcal{D}, \{y_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(\cdot | x)} \left[ \frac{1}{G} \sum_{i=1}^G \min \left( s_i(\theta) \widehat{A}_i, \text{clip} \left( s_i(\theta), 1 - \varepsilon, 1 + \varepsilon \right) \widehat{A}_i \right) \right]\\
+\widehat{A}_i = \frac{r(x, y_i) - \text{mean} \left( \{ r(x, y_i) \}_{i=1}^G \right)}{\text{std} \left( \{ r(x, y_i) \}_{i=1}^G \right)}\\
+s_i(\theta) = \left( \frac{\pi_{\theta}(y_i | x)}{\pi_{\theta_{\text{old}}}(y_i | x)} \right)^{\frac{1}{|y_i|}} = \exp \left( \frac{1}{|y_i|} \sum_{t=1}^{|y_i|} \log \frac{\pi_{\theta}(y_{i,t} | x, y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t} | x, y_{i,<t})} \right)\\
+$$
+
+步骤	GRPO（token 级）	GSPO（sequence 级）
+重要性权重粒度	每个 token 独立计算（3 个值 / 句）	句子级平均（1 个值 / 句，广播到所有 token）
+概率比示例（句子 1）	[1.22, 1.35, 1.0]（token 级差异明显）	[1.182, 1.182, 1.182]（句子级统一值）
+剪辑影响	单个异常 token（如 1.35→1.2）仅影响自身损失	剪辑作用于整个句子，所有 token 受相同影响
+损失聚合方式	按总有效 token 数平均（6 个 token 参与计算）	先按句内 token 平均，再按样本数平均（2 个样本）
+对异常 token 的敏感度	高（如句子 1 中 “黎” 的 1.35 被剪辑，直接改变该 token 损失）	低（异常 token 被句子平均稀释，影响减弱）
+最终损失结果（示例）	-0.415	-0.491（因句子级平均导致优化强度略高）
+
+【参考】
+
+https://zhuanlan.zhihu.com/p/1932791271363154917
+
+
+
+
+
+### TRL框架
+
 ### [VeRL框架](https://arxiv.org/pdf/2409.19256)
 
 【参考】
@@ -4222,7 +4279,65 @@ https://zhuanlan.zhihu.com/p/695112177
 
 ├─ [Qwen2.5]([2412.15115](https://arxiv.org/pdf/2412.15115?))
 
+## 3.5 Qwen-VL
+在通用的MM-LLM（Multi-Modality LLM）框架里，共有五个模块.五个模块按数据流顺序，具体描述如下：
 
+模态编码器（Modality Encoder）：将多模态的数据编码成向量空间特征，该模块通常是单独进行预训练的，典型的方法有基于CNN的ResNET，基于Transformer的ViT等。
+输入投影层（Input Projector）：将模态编码器的输出映射到LLM的输入特征空间的适配层，一般模型结构比较简单，不同的多模态模型一般是随机初始化该模块的参数做冷启训练。典型的网络层：MLP，Cross-Attention等
+LLM主干网络（LLM Backbone）：LLM是经过预训练的模型，一般还要串联多个模块继续做Post-Pretrain和微调，使得模型能识别多模态的特殊token和多模态的特征输入。
+输出投影层（Output Projector）：将LLM生成的数据，映射成Modality Generator 可理解的特征空间，一般是简单的Transformer层或MLP层。
+模态生成器（Modality Generator）：多模态的生成器，最终输出多模态的结果如图像、语音、视频等。模型基本都是基于LDM（Latent Diffusion Models）的衍生模型，如图片领域的Stable Diffusion方法。
+一般这五个模块中，模态编码器，LLM和模态生成器可以是基于大规模样本Pretrain好的模型，然后通过两个投影层，将各个模块串接起来。模型训练一般是通过预训练阶段充分训练Projector层，再按需精细化微调各模块，最终达到理想的端到端的模型效果。
+
+在多模态场景，通常包括两类任务：**理解任务** 和 **生成任务**。对应的模型分别是多模态理解模型和多模态生成模型
+
+多模态理解模型： 主要包括前三个模块（模态编码器，输入投影层，LLM主干网络），即模型接受多模态数据输入，以文本形式输出。
+多模态生成模型：包括全部5个模块，即多模态数据输入，多模态数据输出，多模态生成模型通常要更复杂，也能难建模。
+以上介绍完了通用的MM-LLM的框架。本文梳理的Qwen-VL模型是一系列视觉+文本多模态理解模型，即LVLM(Large-scale Vision-Language Model)，主要处理文本和视觉特征，输入Text、Image、Video，输出Text。
+
+目前Qwen共发布Qwen-VL，Qwen2-VL-2B/7B/72B，Qwen2.5-VL-3B/7B/72B
+
+### [Qwen-VL](https://arxiv.org/pdf/2308.12966)
+![123](assets/Snipaste_2025-08-15_16-25-40.png)
+#### 模型架构及技术细节
+模态（视觉）编码器（Visual Modality Encoder）：只用来编码图片视觉特征。基于OpenCLIP预训练好的ViT-bigG-2B模型。
+接受的图像分辨率为448x448x3，生成[1024, 1664]序列
+
+输入投影层（Input Projector）：位置感知的适配器（position-aware adapter）.这里的Adaper就是一个随机初始化的单层Cross-Attention模块，考虑到位置信息对于精细图像理解的重要性，模块中加入二维绝对位置编码。
+[1024, 1664]序列压缩到[256, 1664]序列
+![74082904495](assets/Snipaste_2025-08-15_16-16-04.png)
+LLM主干网络（LLM Backbone）： Qwen-7B Base 模型
+
+### [Qwen2-VL](https://arxiv.org/pdf/2308.12966)
+![123](assets/Snipaste_2025-08-15_16-34-13.png)
+#### 模型架构及技术细节
+通过 Patch' Pack 保留原生分辨率，目的是为了提升模型计算的吞吐，
+
+Vision Encoder位置编码：2D绝对位置编码 -> 2D-RoPE相对位置编码，从二维三角位置编码升级到二维RoPE位置编码，RoPE对长序列有更好的泛化能力，有利于提升对长序列Vision特征的建模能力
+
+输入投影层：压缩Vision token + MLP Adapter：Qwen-VL在输入投影层做了Vision token的压缩处理，是采用了Cross-Attention的架构，通过一个组可学习的Query向量来压缩原始的特征序列。那么Qwen2-VL为什么没有继续沿用Cross-Attention的架构？
+这里主要是因为Cross-Attention架构适合处理固定长度的k,v，当k,v长短不一时，是不适合做Attention计算的。而Qwen2-VL通过原生动态分辨率方法处理的每个图片的token序列恰恰是变长的，无法使用Cross-Attention架构做特征压缩处理。
+
+LLM主体模型位置编码：1D->3D RoPE，引入多模态旋转位置编码技术（M-RoPE），刻画多模态(时序、高、宽)三维数据。进一步提升对时空数据的建模能力。
+
+统一多模态数据： 单图片 -> 统一图片和视频，统一框架处理图片和视频数据，进一步提升对真实世界认知和理解能力
+
+训练数据： 1.4B -> 1.4T，数据量提升了3个量级，同时数据覆盖了多领域任务。
+
+### [Qwen2.5-VL](https://qwenlm.github.io/zh/blog/qwen2.5-vl/)
+![123](assets/qwen2.5vl_arc.jpeg)
+#### 模型架构及技术细节及提升
+提升时间和空间的感知能力
+
+更简洁高效的视觉编码器
+
+Agent：Qwen2.5-VL 直接作为一个视觉 Agent，可以推理并动态地使用工具，初步具备了使用电脑和使用手机的能力。
+
+理解长视频和捕捉事件
+
+视觉定位:Qwen2.5-VL 可以通过生成 bounding boxes 或者 points 来准确定位图像中的物体，并能够为坐标和属性提供稳定的 JSON 输出。
+
+结构化输出：对于发票、表单、表格等数据，Qwen2.5-VL 支持其内容的结构化输出，惠及金融、商业等领域的应用
 
 ## 3.5 [Deepseek][40]
 
